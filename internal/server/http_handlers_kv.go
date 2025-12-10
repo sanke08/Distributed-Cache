@@ -10,6 +10,20 @@ import (
 	"github.com/sanke08/Distributed-Cache/internal/cache"
 )
 
+type setRequest struct {
+	Key       string `json:"key"`
+	Value     string `json:"value"`
+	TTLSecond int64  `json:"ttl_second,omitempty"`
+}
+
+type internalReplicationRequest struct {
+	UserID    string `json:"user_id"`
+	Key       string `json:"key"`
+	Value     []byte `json:"value"`
+	TTL       int64  `json:"ttl_secs,"`
+	Timestamp int64  `json:"timestamp"`
+}
+
 func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 
 	uid, err := userIDFromHeader(r)
@@ -37,13 +51,14 @@ func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If not owner, forward the original request (body) to owner
 	if owner.Addr != s.cfg.HTTPAddr {
-		// forward
+		// fforward original body as-is
 		s.forwardToOwner(owner, w, r)
 		return
 	}
 
-	// owner is self -> operate locally
+	// owner is self -> do fast local write and enqueue replication tasks
 	ttl := time.Duration(0)
 	if req.TTLSecond > 0 {
 		ttl = time.Duration(req.TTLSecond) * time.Second
@@ -52,7 +67,19 @@ func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 	_, cancel := context.WithTimeout(r.Context(), s.cfg.CmdTimeout)
 	defer cancel()
 
-	if err := s.cache.Set(uid, req.Key, []byte(req.Value), ttl); err != nil {
+	// Ensure user exists
+	if err := s.cache.CreateUser(uid); err != nil {
+		if err != cache.ErrUserExists {
+			log.Printf("[http] create user err: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	timestamp := time.Now().UnixNano()
+
+	// Local fast write (Set inside ReplicateSet handles timestamp logic)
+	if err := s.cache.Set(uid, req.Key, []byte(req.Value), ttl, timestamp); err != nil {
 		if err == cache.ErrUserNotFound {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
@@ -62,6 +89,10 @@ func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// enqueue replication to other replicas (non-blocking)
+	s.enqueueReplication(uid, req.Key, []byte(req.Value), req.TTLSecond, timestamp)
+
+	// immediate success response
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
@@ -186,4 +217,33 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 	resp := keyResponse{Keys: keys}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// Internal replication endpoint - replicas accept these writes from primary.
+func (s *Server) handleInternalReplicate(w http.ResponseWriter, r *http.Request) {
+	var req internalReplicationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	ttl := time.Duration(0)
+	if req.TTL > 0 {
+		ttl = time.Duration(req.TTL) * time.Second
+	}
+
+	// ensure user exists (create if necessary)
+	if err := s.cache.CreateUser(req.UserID); err != nil && err != cache.ErrUserExists {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// apply replicated write - replicateSet ensures timestamp ordering
+	if err := s.cache.Set(req.UserID, req.Key, req.Value, ttl, req.Timestamp); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
+
 }

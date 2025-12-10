@@ -30,6 +30,12 @@ type ServerConfig struct {
 	ClusterReplicas int    // number of virtual nodes per actual node
 	JoinAddr        string // leader address to join, e.g., "http://leader:8080"
 	PollInterval    time.Duration
+
+	// replication config
+	ReplicationWorkers    int
+	ReplicationQueueSize  int
+	ReplicationTimeout    time.Duration
+	ReplicationMaxRetries int
 }
 
 type Server struct {
@@ -46,6 +52,9 @@ type Server struct {
 
 	cluster *cluster.ClusterState
 
+	// replication manager
+	replicator *replicationManager
+
 	shutdownOnce sync.Once
 	shutdownCh   chan struct{}
 }
@@ -53,6 +62,23 @@ type Server struct {
 func NewServer(c *cache.Cache, cfg ServerConfig) *Server {
 	if cfg.CmdTimeout == 0 {
 		cfg.CmdTimeout = 5 * time.Second
+	}
+
+	// set defaults for replication if zero
+	if cfg.ReplicationWorkers == 0 {
+		cfg.ReplicationWorkers = 4
+	}
+
+	if cfg.ReplicationQueueSize == 0 {
+		cfg.ReplicationQueueSize = 10000
+	}
+
+	if cfg.ReplicationTimeout == 0 {
+		cfg.ReplicationTimeout = 500 * time.Millisecond
+	}
+
+	if cfg.ReplicationMaxRetries == 0 {
+		cfg.ReplicationMaxRetries = 3
 	}
 
 	return &Server{
@@ -73,7 +99,7 @@ func (s *Server) Start() error {
 	// create NodeInfo for current server
 	id := s.cfg.NodeID
 	if id == "" {
-		// derive id from addr (simple); in real system use UUID
+		// derive id from addr (simple);
 		id = s.cfg.HTTPAddr
 	}
 
@@ -82,6 +108,10 @@ func (s *Server) Start() error {
 	// initialize cluster state
 	cs := cluster.NewClusterState(self, s.cfg.ClusterReplicas)
 	s.cluster = cs
+
+	// replication manager
+	s.replicator = newReplicationManager(s.cfg.ReplicationWorkers, s.cfg.ReplicationQueueSize, s.cfg.ReplicationTimeout, s.cfg.ReplicationMaxRetries)
+	s.replicator.start()
 
 	// If join addr provided, join leader and start polling
 	if s.cfg.JoinAddr != "" {
@@ -93,7 +123,13 @@ func (s *Server) Start() error {
 			stop := make(chan struct{})
 			go cs.PollLeader(s.cfg.JoinAddr, s.cfg.PollInterval, stop)
 			// when server shutdown close stop via s.shutdownCh handling later (not shown)
-			// we'll close stop in Shutdown
+			// close stop in Shutdown
+
+			go func() {
+				<-s.shutdownCh
+				close(stop)
+			}()
+
 		}
 	} else {
 		// current node is leader
@@ -204,4 +240,24 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	// allow remaining cleanup
 	return nil
+}
+
+// enqueueReplication enqueues replication tasks for a write (primary already stored locally).
+func (s *Server) enqueueReplication(userID, key string, value []byte, ttlSec int64, timestamp int64) {
+	// get replica nodes (N)
+	replicas := s.cluster.GetReplicaNodes(userID+":|:"+key, s.cluster.Replicas)
+
+	// skip first (primary) since primary already has the write
+	for i := 1; i < len(replicas); i++ {
+		t := replicationTask{
+			To:        replicas[i],
+			UserID:    userID,
+			Key:       key,
+			Value:     value,
+			TTLSec:    ttlSec,
+			Timestamp: timestamp,
+			Attempts:  0,
+		}
+		s.replicator.enqueue(t) // non-blocking; if queue full, task dropped and logged
+	}
 }

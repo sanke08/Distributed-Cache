@@ -33,12 +33,8 @@ func registerHTTPHandlers(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("POST /v1/cluster/join", s.handleClusterJoin)
 	mux.HandleFunc("GET /v1/cluster/state", s.handleStat)
 
-}
-
-type setRequest struct {
-	Key       string `json:"key"`
-	Value     string `json:"value"`
-	TTLSecond int    `json:"ttl_seconds,omitempty"`
+	// replication
+	mux.HandleFunc("/v1/internal/replicate", s.handleInternalReplicate)
 }
 
 type valueResponse struct {

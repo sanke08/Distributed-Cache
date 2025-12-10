@@ -33,17 +33,21 @@ func main() {
 	}
 
 	srvConfig := server.ServerConfig{
-		HTTPAddr:        *httpAddr,
-		TCPAddr:         *tcpAddr,
-		CmdTimeout:      5 * time.Second,
-		ReadTimeout:     10 * time.Second,
-		WriteTimeout:    10 * time.Second,
-		IdealTimeout:    120 * time.Second,
-		ShutdownTimeout: 5 * time.Second,
-		NodeID:          *nodeID,
-		JoinAddr:        *join,
-		ClusterReplicas: 10,
-		PollInterval:    2 * time.Second,
+		HTTPAddr:              *httpAddr,
+		TCPAddr:               *tcpAddr,
+		CmdTimeout:            5 * time.Second,
+		ReadTimeout:           10 * time.Second,
+		WriteTimeout:          10 * time.Second,
+		IdealTimeout:          120 * time.Second,
+		ShutdownTimeout:       5 * time.Second,
+		NodeID:                *nodeID,
+		JoinAddr:              *join,
+		ClusterReplicas:       10,
+		PollInterval:          2 * time.Second,
+		ReplicationWorkers:    4,
+		ReplicationQueueSize:  100,
+		ReplicationTimeout:    300 * time.Millisecond,
+		ReplicationMaxRetries: 3,
 	}
 
 	s := server.NewServer(c, srvConfig)

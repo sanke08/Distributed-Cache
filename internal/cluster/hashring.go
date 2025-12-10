@@ -32,7 +32,7 @@ func NewHashRing(replicas int) *HashRing {
 }
 
 func hashStr(s string) int64 {
-	h := fnv.New64a() //non crypto hash
+	h := fnv.New64a()
 	h.Write([]byte(s))
 	return int64(h.Sum64())
 }
@@ -127,10 +127,56 @@ func (hr *HashRing) ReplaceFromSnapshot(snapshot map[string]NodeInfo, replicas i
 
 	for hashStr, node := range snapshot {
 		// parse hash
-		var h uint64
-		fmt.Sscan(hashStr, &h)
+		// var h uint64
+		// fmt.Sscan(hashStr, &h)
+		h, err := strconv.ParseInt(hashStr, 10, 64)
+		if err != nil {
+			panic(err)
+		}
 		hr.hashes = append(hr.hashes, int64(h))
 		hr.nodes[int64(h)] = node
 	}
 	slices.Sort(hr.hashes)
+}
+
+// GetSuccessorNodes returns up to 'count' unique real nodes starting from the primary for the given key.
+// It walks the virtual nodes clockwise, skipping duplicate real nodes.
+func (hr *HashRing) GetSuccessorNodes(key string, count int) []NodeInfo {
+	hr.mu.RLock()
+	defer hr.mu.RUnlock()
+
+	res := make([]NodeInfo, 0, count)
+
+	if len(hr.hashes) == 0 || count <= 0 {
+		return res
+	}
+
+	// get the hash for the given key
+	h := hashStr(key)
+
+	// find the start index *[it return initial index of owner of (key)]
+	idx := sort.Search(len(hr.hashes), func(i int) bool {
+		return hr.hashes[i] >= h // internally reduce J till it is greater than or equal to h
+	})
+
+	// if idx == len(hr.hashes), it means the key is greater than all hashes.
+	// In that case, we wrap around to the first node.
+	if idx == len(hr.hashes) {
+		// wrap
+		idx = 0
+	}
+
+	seen := make(map[string]struct{})
+
+	for i := 0; (len(res) < count) && (i < len(hr.hashes)); i++ {
+		pos := (idx + i) % len(hr.hashes)
+		hash := hr.hashes[pos]
+		node := hr.nodes[hash]
+		if _, ok := seen[node.ID]; ok {
+			continue
+		}
+		seen[node.ID] = struct{}{}
+		res = append(res, node)
+	}
+	return res
 }

@@ -179,7 +179,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				ttl = time.Duration(ttlSec) * time.Second
 			}
 
-			if err := s.cache.Set(uid, key, []byte(value), ttl); err != nil {
+			if err := s.cache.Set(uid, key, []byte(value), ttl, 0); err != nil {
 				if err == cache.ErrUserNotFound {
 					writeErr("user not found")
 				} else {

@@ -13,14 +13,14 @@ type ClusterState struct {
 	mu       sync.RWMutex
 	ring     *HashRing
 	nodesMap map[string]NodeInfo // id -> NodeInfo
-	replicas int
+	Replicas int
 	self     NodeInfo
 }
 
 func NewClusterState(self NodeInfo, replicas int) *ClusterState {
 	cs := &ClusterState{
 		self:     self,
-		replicas: replicas,
+		Replicas: replicas,
 		ring:     NewHashRing(replicas),
 		nodesMap: make(map[string]NodeInfo),
 		mu:       sync.RWMutex{},
@@ -83,7 +83,7 @@ func (cs *ClusterState) Snapshot() ([]byte, error) {
 		Ring     map[string]NodeInfo `json:"ring"` // hash->node
 	}
 	p := payload{
-		Replicas: cs.replicas,
+		Replicas: cs.Replicas,
 		Nodes:    cs.Nodes(),
 		Ring:     cs.ring.Snapshot(),
 	}
@@ -110,7 +110,7 @@ func (cs *ClusterState) IsLeader() bool {
 func (cs *ClusterState) ReplaceFromPayload(replicas int, nodes []NodeInfo, ring map[string]NodeInfo) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	cs.replicas = replicas
+	cs.Replicas = replicas
 	cs.nodesMap = make(map[string]NodeInfo, len(nodes))
 	for _, n := range nodes {
 		cs.nodesMap[n.ID] = n
@@ -150,4 +150,11 @@ func (cs *ClusterState) PollLeader(leaderAddr string, interval time.Duration, st
 			resp.Body.Close()
 		}
 	}
+}
+
+// GetReplicaNodes returns up to 'count' replica nodes (primary + successors).
+func (cs *ClusterState) GetReplicaNodes(key string, count int) []NodeInfo {
+	cs.mu.RLocker()
+	defer cs.mu.RUnlock()
+	return cs.ring.GetSuccessorNodes(key, count)
 }

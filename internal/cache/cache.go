@@ -55,12 +55,22 @@ func (c *Cache) DeleteUser(userID string) error {
 	return nil
 }
 
-func (c *Cache) Set(userID, key string, value []byte, ttl time.Duration) error {
+// New: called by internal replication endpoint to set with timestamp semantics.
+// It creates user if missing. It only writes if incoming timestamp >= existing timestamp.
+func (c *Cache) Set(userID, key string, value []byte, ttl time.Duration, timestamp int64) error {
 	uc := c.getUser(userID)
 	if uc == nil {
-		return ErrUserNotFound
+		// try to create the user
+		if err := c.CreateUser(userID); err != nil && err != ErrUserExists {
+			return err
+		}
+		uc = c.getUser(userID)
+		if uc == nil {
+			return ErrUserNotFound
+		}
 	}
-	uc.set(key, value, ttl)
+	// only write if timestamp is newer or equal
+	uc.set(key, value, ttl, timestamp)
 	return nil
 }
 
@@ -110,6 +120,7 @@ type PersistedItem struct {
 	Key       string    `json:"key"`
 	Value     []byte    `json:"value"`      // JSON handles base64 for []byte
 	ExpiresAt time.Time `json:"expires_at"` // zero => no expiry
+	Timestamp int64     `json:"timestamp"`  //Timestamp for ordering.
 }
 
 // UserSnapshot is a serializable representation of a user's items.
@@ -138,6 +149,7 @@ func (c *Cache) SnapshotUser(userID string) (*UserSnapshot, error) {
 			Key:       k,
 			Value:     v.Value,
 			ExpiresAt: v.ExpiresAt,
+			Timestamp: v.Timestamp,
 		})
 	}
 	return snap, nil
@@ -238,6 +250,7 @@ func (c *Cache) RestoreUserFromSnapshot(snap *UserSnapshot) error {
 		items[item.Key] = Item{
 			Value:     vCopy,
 			ExpiresAt: item.ExpiresAt,
+			Timestamp: item.Timestamp,
 		}
 	}
 
@@ -298,7 +311,7 @@ func (c *Cache) LoadAllUsersFromDir() (int, error) {
 }
 
 func isUserSnapshotFile(filename string) bool {
-	return strings.HasPrefix(filename, "user_") && strings.HasSuffix(filename, ".json") && len(filename) != len("user_.json")
+	return strings.HasPrefix(filename, "user_") && strings.HasSuffix(filename, ".json") && len(filename) > len("user_.json")
 }
 
 func getUserIDFromFilename(filename string) string {

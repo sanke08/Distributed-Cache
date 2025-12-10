@@ -10,6 +10,7 @@ import (
 type Item struct {
 	Value     []byte
 	ExpiresAt time.Time
+	Timestamp int64 // // UnixNano timestamp of last write. it is in Int format
 }
 
 type lruEntry struct {
@@ -99,10 +100,16 @@ func (uc *UserCache) get(key string) (Item, bool) {
 
 }
 
-func (uc *UserCache) set(key string, value []byte, ttl time.Duration) {
+// set writes without timestamp checks (used for local writes from clients).
+// It sets Item.Timestamp to provided ts (if ts==0, sets now).
+func (uc *UserCache) set(key string, value []byte, ttl time.Duration, ts int64) {
 	var expires time.Time
 	if ttl > 0 {
 		expires = time.Now().Add(ttl)
+	}
+
+	if ts == 0 {
+		ts = time.Now().UnixNano()
 	}
 
 	// input := []byte("secret")
@@ -116,8 +123,17 @@ func (uc *UserCache) set(key string, value []byte, ttl time.Duration) {
 	uc.mu.Lock()
 	defer uc.mu.Unlock()
 
-	if _, ok := uc.items[key]; ok {
-		uc.items[key] = Item{Value: vCopy, ExpiresAt: expires}
+	//  only accept updates with a timestamp >= current.
+	// This enforces last-write-wins and prevents overwriting newer data.
+
+	existing, ok := uc.items[key]
+	if ok {
+		if ts < existing.Timestamp {
+			// ignore older write
+			return
+		}
+
+		uc.items[key] = Item{Value: vCopy, ExpiresAt: expires, Timestamp: ts}
 		uc.moveToFront(key)
 		return
 	}
@@ -256,7 +272,7 @@ func (uc *UserCache) Snapshot() (map[string]Item, error) {
 	for k, v := range uc.items {
 		vCopy := make([]byte, len(v.Value))
 		copy(vCopy, v.Value)
-		out[k] = Item{Value: vCopy, ExpiresAt: v.ExpiresAt}
+		out[k] = Item{Value: vCopy, ExpiresAt: v.ExpiresAt, Timestamp: v.Timestamp}
 	}
 
 	return out, nil
@@ -276,7 +292,7 @@ func (uc *UserCache) RestoreFromSnapshot(items map[string]Item) error {
 		// copy value
 		vCopy := make([]byte, len(v.Value))
 		copy(vCopy, v.Value)
-		uc.items[k] = Item{Value: vCopy, ExpiresAt: v.ExpiresAt}
+		uc.items[k] = Item{Value: vCopy, ExpiresAt: v.ExpiresAt, Timestamp: v.Timestamp}
 		// add to LRU (treat snapshot insertion as most-recent)
 		el := uc.lruList.PushFront(&lruEntry{key: k})
 		uc.lruMap[k] = el

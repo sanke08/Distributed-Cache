@@ -12,6 +12,8 @@ A production-grade distributed in-memory cache system built in Go with consisten
 - 💾 **Persistence**: Snapshot and restore capabilities
 - 🔀 **Request Forwarding**: Automatic routing to the correct node (HTTP only)
 - 🎯 **Leader-Follower**: Simple leader election based on lexicographic node ID
+- 🔁 **Asynchronous Replication**: Background worker pool for data replication across nodes
+- ⏰ **Conflict Resolution**: Timestamp-based Last-Write-Wins (LWW) for eventual consistency
 
 ---
 
@@ -44,7 +46,7 @@ A production-grade distributed in-memory cache system built in Go with consisten
 │  │  HTTP Server │              │  TCP Server  │                 │
 │  │  (Port 8080) │              │ (Port 9000)  │                 │
 │  └──────┬───────┘              └──────┬───────┘                 │
-│         │                              │                         │
+│         │                             │                         │
 │         ▼                              ▼                         │
 │  ┌─────────────────────────────────────────────┐                │
 │  │         Request Handler Layer                │                │
@@ -63,6 +65,7 @@ A production-grade distributed in-memory cache system built in Go with consisten
 │  │  • Membership Management (AddNode/RemoveNode)         │       │
 │  │  • Leader Election (IsLeader)                         │       │
 │  │  • Request Routing (LookupOwner)                      │       │
+│  │  • Replica Selection (GetSuccessorNodes)              │       │
 │  │  • State Synchronization (PollLeader)                 │       │
 │  └──────────────────┬───────────────────────────────────┘       │
 │                     │                                            │
@@ -122,6 +125,7 @@ distributed-cache/
 │   │   ├── http_handlers_kv.go     # KV operation handlers (distributed)
 │   │   ├── http_handlers_user.go   # User management handlers
 │   │   ├── http_handlers_cluster.go# Cluster API handlers
+│   │   ├── replication.go          # Async replication worker pool
 │   │   └── tcp.go                  # TCP protocol implementation
 │   │
 │   └── cmd/                        # Application entry point
@@ -135,24 +139,25 @@ distributed-cache/
 
 #### `internal/cache/`
 
-- **`cache.go`**: Manages multiple user caches, provides snapshot/restore for all users
-- **`user_cache.go`**: Individual user's cache with LRU tracking, TTL expiration, and janitor goroutine
+- **`cache.go`**: Manages multiple user caches, provides snapshot/restore for all users, timestamp-aware Set()
+- **`user_cache.go`**: Individual user's cache with LRU tracking, TTL expiration, timestamp-based conflict resolution, and janitor goroutine
 - **`config.go`**: Configuration for cache (eviction limits, janitor intervals, etc.)
 - **`errors.go`**: Domain-specific errors (`ErrUserNotFound`, `ErrKeyNotFound`, etc.)
 
 #### `internal/cluster/`
 
-- **`cluster.go`**: Manages cluster membership, leader election, and state synchronization
-- **`hashring.go`**: Implements consistent hashing with virtual nodes
+- **`cluster.go`**: Manages cluster membership, leader election, state synchronization, and replica selection
+- **`hashring.go`**: Implements consistent hashing with virtual nodes and successor node lookup
 - **`node.go`**: Simple struct for node identification (ID + Address)
 
 #### `internal/server/`
 
-- **`server.go`**: Coordinates HTTP/TCP server lifecycle, handles cluster join logic
-- **`http_handlers_kv.go`**: GET/SET/DELETE/KEYS handlers with cluster-aware forwarding
+- **`server.go`**: Coordinates HTTP/TCP server lifecycle, handles cluster join logic, manages replication workers
+- **`http_handlers_kv.go`**: GET/SET/DELETE/KEYS handlers with cluster-aware forwarding and replication
 - **`http_handlers_user.go`**: User creation/deletion and snapshot/restore handlers
 - **`http_handlers_cluster.go`**: Join and state endpoints for cluster coordination
-- **`tcp.go`**: Text-based TCP protocol (local-only, no distributed forwarding)
+- **`replication.go`**: Asynchronous replication manager with worker pool and retry logic
+- **`tcp.go`**: Text-based TCP protocol (local-only, no distributed forwarding or replication)
 
 #### `internal/cmd/`
 
@@ -221,7 +226,44 @@ X-User-Id: user1
         200 OK
 ```
 
-### 3. Local Write (TCP)
+### 3. Asynchronous Replication (Background)
+
+After a successful write to the primary owner, replication happens asynchronously:
+
+```
+Node B (Primary)          Workers          Replicas (C & A)
+────────────────          ───────          ────────────────
+Write succeeds locally
+Generate timestamp: ts
+        │
+        ▼
+Get replicas:
+GetSuccessorNodes(key, 3)
+→ [B, C, A]
+        │
+        ▼
+Skip self, enqueue for C & A
+        │
+        ├─────────────────► Worker picks task
+        │                   POST /v1/internal/replicate
+        │                   {user, key, val, ts}
+        │                          │
+        │                          ├───────────► Node C
+        │                          │             Apply if ts >= existing
+        │                          │             200 OK
+        │                          │
+        │                          └───────────► Node A
+        │                                        Apply if ts >= existing
+        │                                        200 OK
+        ▼
+Return to client
+(don't wait for replicas)
+
+Retries: 3 attempts with 2s backoff on failure
+Queue: Bounded at 10,000 tasks (drops on overflow)
+```
+
+### 4. Local Write (TCP)
 
 ```
 TCP Client                Node A
@@ -486,6 +528,27 @@ GET /v1/cluster/state
 GET /v1/ping
 ```
 
+### Internal Endpoints
+
+> **⚠️ Warning**: These endpoints are for internal cluster communication only. Do NOT expose to public clients.
+
+**Replicate Data** (Internal use only)
+
+```http
+POST /v1/internal/replicate
+Content-Type: application/json
+
+{
+  "user_id": "alice",
+  "key": "session",
+  "value": "YWJjMTIz",  // base64 encoded []byte
+  "ttl_secs": 3600,
+  "timestamp": 1733860453724578300
+}
+```
+
+Used by replication workers to propagate writes from primary to replicas. Timestamp ensures Last-Write-Wins conflict resolution.
+
 ---
 
 ### TCP Protocol
@@ -573,8 +636,14 @@ type ServerConfig struct {
     IdealTimeout    time.Duration // 120s
     NodeID          string
     JoinAddr        string
-    ClusterReplicas int           // Virtual nodes per physical node
-    PollInterval    time.Duration // How often followers poll leader
+    ClusterReplicas int           // Virtual nodes per physical node (default: 10)
+    PollInterval    time.Duration // How often followers poll leader (default: 2s)
+
+    // Replication Settings
+    ReplicationWorkers    int           // Concurrent worker goroutines (default: 4)
+    ReplicationQueueSize  int           // Task buffer size (default: 10,000)
+    ReplicationTimeout    time.Duration // HTTP client timeout (default: 300ms)
+    ReplicationMaxRetries int           // Retry attempts per task (default: 3)
 }
 ```
 
@@ -591,25 +660,45 @@ The TCP protocol does **not** support distributed request forwarding. When a TCP
 
 **Workaround**: Use HTTP API for distributed operations, or implement client-side sharding for TCP.
 
-### 2. No Replication
+### 2. Asynchronous Replication Only
 
-Data is stored on a single node (the one determined by the hash ring). If that node fails, data is lost.
+**Current Implementation**: Data is replicated asynchronously to N successor nodes via a background worker pool.
 
-**Future Enhancement**: Implement replication factor (store copies on N nodes).
+**Limitations**:
 
-### 3. No Node Failure Detection
+- Writes return success before replicas confirm receipt
+- If primary crashes before replication completes, replicas may miss the write
+- No synchronous replication option for critical data
+
+**Tradeoff**: Prioritizes low latency over durability. Acceptable for cache use cases.
+
+### 3. DELETE Operations Not Replicated
+
+**Issue**: Only SET operations trigger replication. DELETE requests are local-only.
+
+**Impact**: Deleting a key on the primary does NOT delete it on replicas, leading to stale data.
+
+**Future Enhancement**: Add replication logic to `handleDelete()`.
+
+### 4. No Read Repair or Anti-Entropy
+
+**Issue**: If replication fails (network partition, queue overflow), replicas become stale. There's no mechanism to detect/fix inconsistencies.
+
+**Future Enhancement**: Implement periodic gossip protocol or merkle tree comparison.
+
+### 5. No Node Failure Detection
 
 If a node crashes, it remains in the cluster state until manually removed.
 
 **Future Enhancement**: Implement heartbeat-based failure detection.
 
-### 4. Leader is a Single Point of Failure
+### 6. Leader is a Single Point of Failure
 
 If the leader crashes, followers can't add new nodes (join requests fail).
 
 **Workaround**: Followers will automatically recognize the next-smallest node as leader, but join functionality requires a full cluster restart.
 
-### 5. No Authentication/Authorization
+### 7. No Authentication/Authorization
 
 The system has no built-in auth.
 
